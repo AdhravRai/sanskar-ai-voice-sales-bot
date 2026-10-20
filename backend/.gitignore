@@ -1,0 +1,16 @@
+*.pyc
+*.db
+recordings/
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+node_modules/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+backend/data/
+.venv/
+venv/
