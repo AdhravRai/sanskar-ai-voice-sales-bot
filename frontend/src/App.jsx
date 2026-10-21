@@ -99,8 +99,10 @@ function App() {
         throw new Error("Could not load call history.");
       }
 
+
       const data = await response.json();
-      setHistory(data);
+      setHistory(Array.isArray(data) ? data : (data.calls ?? []));
+
     } catch (err) {
       setError(err.message || "Could not load call history.");
     }
