@@ -1,115 +1,121 @@
 
-import json
 import os
-import uuid
-from pathlib import Path
+import json
 from datetime import datetime, timezone
-from typing import Optional
+from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from groq import Groq
-from pydantic import BaseModel
+from groq import Groq, APIError
+from pydantic import BaseModel, Field
 
 from database import (
-    RECORDINGS_DIR,
-    create_call,
-    get_all_calls,
+    initialize_db,
+    save_call,
+    list_calls,
     get_call,
-    init_db,
+    RECORDINGS_DIR,
 )
-from sales_analysis import analyze_sales_call
+from sales_analysis import analyze_call
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
 
-app = FastAPI(title="AI Voice Sales Bot API")
+load_dotenv()
+
+api_key = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=api_key) if api_key else None
+
+app = FastAPI(title="Sankar AI Voice Sales Bot")
 
 frontend_origins = [
     origin.strip().rstrip("/")
     for origin in os.getenv(
         "FRONTEND_ORIGINS",
-        "https://sanskar-ai-voice-sales-bot.vercel.app"
+        "http://localhost:5173,https://sanskar-ai-voice-sales-bot.vercel.app",
     ).split(",")
     if origin.strip()
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in allowed_origins],
+    allow_origins=frontend_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-groq_api_key = os.getenv("GROQ_API_KEY")
-groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
-
 SYSTEM_PROMPT = """
-You are FlowDesk's friendly, professional SaaS sales representative.
+You are a friendly, professional AI sales representative.
 
-FlowDesk is a fictional sales and workflow management platform.
-Your goal is to understand the customer's needs and explain how
-FlowDesk may help. Ask one short question at a time.
+You are selling FlowDesk, a fictional SaaS product for small businesses.
 
-Be conversational, concise, and honest. Do not invent product
-features, prices, integrations, or guarantees. If the customer
-asks for details that have not been provided, offer to arrange a
-demo or have a sales representative follow up.
+Product details:
+- Organizes team tasks and projects.
+- Tracks deadlines and progress.
+- Provides a shared team dashboard.
+- Offers a fictional demo and a free trial.
+- Pricing: $12 per user per month.
 
-Never pressure the customer. If they decline, acknowledge their
-decision politely. If they request a demo, confirm that the team
-can follow up to arrange one; do not claim a booking has occurred.
+Your goals:
+1. Understand the customer's needs.
+2. Explain relevant product benefits clearly.
+3. Answer questions using only the product details provided.
+4. Handle objections respectfully without pressure.
+5. Ask whether the customer wants a demo or trial when appropriate.
+
+Keep replies concise and natural for spoken English.
+Never claim a purchase or demo booking has occurred unless
+the application has actually recorded that action.
+Never invent product capabilities, discounts, or customer data.
 """
 
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str = Field(min_length=1, max_length=2000)
+
+
 class ChatRequest(BaseModel):
-    message: str
-    history: list[dict] = []
-
-
-@app.on_event("startup")
-def startup():
-    init_db()
-
-
-@app.get("/")
-def root():
-    return {"message": "FlowDesk AI Voice Sales Bot API is running."}
+    messages: list[ChatMessage] = Field(min_length=1, max_length=30)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "ai_configured": client is not None}
 
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
-    if not groq_client:
+    if client is None:
         raise HTTPException(
-            status_code=500,
-            detail="GROQ_API_KEY is missing from backend/.env",
+            status_code=503,
+            detail="GROQ_API_KEY is not configured.",
         )
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if any(m.role not in ("user", "assistant") for m in request.messages):
+        raise HTTPException(status_code=400, detail="Invalid message role.")
 
-    for item in request.history[-12:]:
-        role = item.get("role")
-        content = item.get("content", "")
+    if request.messages[-1].role != "user":
+        raise HTTPException(
+            status_code=400,
+            detail="The final message must be from the customer.",
+        )
 
-        if role in ("user", "assistant") and content:
-            messages.append({"role": role, "content": content})
-
-    messages.append({"role": "user", "content": request.message})
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *[m.model_dump() for m in request.messages],
+    ]
 
     try:
-        response = groq_client.chat.completions.create(
+        result = client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=messages,
             max_completion_tokens=1024,
-            temperature=0.5,
         )
-        reply = response.choices[0].message.content
+
+        reply = result.choices[0].message.content
 
         if not reply:
             raise HTTPException(
@@ -117,136 +123,149 @@ def chat(request: ChatRequest):
                 detail="The AI returned an empty response.",
             )
 
-        return {"reply": reply.strip()}
+        return {"reply": reply}
 
-    except HTTPException:
-        raise
-    except Exception as exc:
+    except APIError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"AI response failed: {str(exc)}",
-        )
+            detail=(
+                "The AI provider request failed. "
+                "Check your API limits and configuration."
+            ),
+        ) from exc
+
+
+@app.on_event("startup")
+def startup():
+    initialize_db()
 
 
 @app.post("/api/calls")
-async def save_call(
+async def create_call(
     transcript: str = Form(...),
-    duration_seconds: int = Form(0),
-    consent: bool = Form(False),
-    recording: Optional[UploadFile] = File(None),
+    duration_seconds: int = Form(...),
+    consent: bool = Form(...),
+    recording: UploadFile | None = File(None),
 ):
-    if not consent and recording is not None:
+    if not consent:
         raise HTTPException(
             status_code=400,
-            detail="Recording upload requires consent.",
+            detail="Recording consent is required.",
+        )
+
+    if duration_seconds < 0 or duration_seconds > 86400:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid call duration.",
         )
 
     try:
-        transcript_data = json.loads(transcript)
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="Transcript must be valid JSON.",
-        )
+        messages = json.loads(transcript)
 
-    if not isinstance(transcript_data, list):
-        raise HTTPException(
-            status_code=400,
-            detail="Transcript must be a list of messages.",
-        )
+        if not isinstance(messages, list):
+            raise ValueError("Transcript must be a list.")
 
-    if duration_seconds < 0:
+        if len(messages) > 500:
+            raise ValueError("Transcript is too long.")
+
+        for message in messages:
+            if (
+                not isinstance(message, dict)
+                or message.get("role") not in ("user", "assistant")
+                or not isinstance(message.get("content"), str)
+            ):
+                raise ValueError("Invalid transcript message.")
+
+    except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(
             status_code=400,
-            detail="Duration cannot be negative.",
-        )
+            detail=f"Invalid transcript: {exc}",
+        ) from exc
 
     recording_path = None
 
-    if recording is not None:
-        allowed_types = {
+    if recording and recording.filename:
+        if recording.content_type not in (
             "audio/webm",
-            "audio/webm;codecs=opus",
-            "audio/ogg",
             "audio/mp4",
-            "audio/mpeg",
+            "audio/ogg",
             "audio/wav",
-        }
-
-        content_type = (recording.content_type or "").lower()
-
-        if not content_type.startswith("audio/"):
+            "audio/mpeg",
+        ):
             raise HTTPException(
                 status_code=400,
-                detail="Only audio recordings are accepted.",
+                detail="Unsupported audio format.",
             )
 
-        extension = Path(recording.filename or "").suffix.lower()
-        if extension not in {".webm", ".ogg", ".mp4", ".mp3", ".wav", ".m4a"}:
-            extension = ".webm"
+        audio = await recording.read()
 
-        filename = f"{uuid.uuid4().hex}{extension}"
-        destination = RECORDINGS_DIR / filename
+        if len(audio) > 20 * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail="Recording must be smaller than 20 MB.",
+            )
 
-        try:
-            contents = await recording.read()
+        if not audio:
+            raise HTTPException(
+                status_code=400,
+                detail="Recording file is empty.",
+            )
 
-            if len(contents) > 25 * 1024 * 1024:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Recording exceeds the 25 MB limit.",
-                )
+        extension = {
+            "audio/webm": ".webm",
+            "audio/mp4": ".mp4",
+            "audio/ogg": ".ogg",
+            "audio/wav": ".wav",
+            "audio/mpeg": ".mp3",
+        }[recording.content_type]
 
-            destination.write_bytes(contents)
-            recording_path = str(destination)
-        finally:
-            await recording.close()
+        filename = f"{uuid4().hex}{extension}"
+        path = RECORDINGS_DIR / filename
+        path.write_bytes(audio)
+        recording_path = str(path)
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    ended_at = started_at
 
     try:
-        analysis = analyze_sales_call(transcript_data)
-
-        call_id = create_call(
-            transcript=transcript_data,
-            duration_seconds=duration_seconds,
-            consent=consent,
-            recording_path=recording_path,
-            analysis=analysis,
-        )
-
-        return {
-            "id": call_id,
-            "summary": analysis["summary"],
-            "customer_requirements": analysis["customer_requirements"],
-            "objections": analysis["objections"],
-            "next_steps": analysis["next_steps"],
-            "sales_status": analysis["sales_status"],
-            "message": "Call saved successfully.",
-        }
-
+        analysis = analyze_call(client, messages)
     except Exception as exc:
         if recording_path:
-            try:
-                Path(recording_path).unlink(missing_ok=True)
-            except OSError:
-                pass
+            Path(recording_path).unlink(missing_ok=True)
 
         raise HTTPException(
             status_code=502,
-            detail=f"Unable to analyze or save the call: {str(exc)}",
-        )
+            detail="Call analysis failed. Check the AI provider and retry.",
+        ) from exc
 
+    call_id = save_call(
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_seconds=duration_seconds,
+        transcript=json.dumps(messages),
+        recording_path=recording_path,
+        summary=analysis["summary"],
+        customer_requirements=json.dumps(
+            analysis["customer_requirements"]
+        ),
+        objections=json.dumps(analysis["objections"]),
+        next_steps=json.dumps(analysis["next_steps"]),
+        sales_status=analysis["sales_status"],
+    )
 
-def format_call(row):
-    row["transcript"] = json.loads(row["transcript"])
-    row["has_recording"] = bool(row.get("recording_path"))
-    row.pop("recording_path", None)
-    row["consent"] = bool(row["consent"])
-    return row
+    return {
+        "id": call_id,
+        "summary": analysis["summary"],
+        "customer_requirements": analysis["customer_requirements"],
+        "objections": analysis["objections"],
+        "next_steps": analysis["next_steps"],
+        "sales_status": analysis["sales_status"],
+    }
 
 
 @app.get("/api/calls")
-def list_calls():
-    return [format_call(call) for call in get_all_calls()]
+def call_history():
+    return {"calls": list_calls()}
 
 
 @app.get("/api/calls/{call_id}")
@@ -256,32 +275,39 @@ def call_details(call_id: int):
     if not call:
         raise HTTPException(status_code=404, detail="Call not found.")
 
-    return format_call(call)
+    call["transcript"] = json.loads(call["transcript"])
+    call["customer_requirements"] = json.loads(
+        call["customer_requirements"]
+    )
+    call["objections"] = json.loads(call["objections"])
+    call["next_steps"] = json.loads(call["next_steps"])
+
+    if call["recording_path"]:
+        call["recording_url"] = f"/api/calls/{call_id}/recording"
+    else:
+        call["recording_url"] = None
+
+    call.pop("recording_path", None)
+
+    return call
 
 
 @app.get("/api/calls/{call_id}/recording")
 def get_recording(call_id: int):
     call = get_call(call_id)
 
-    if not call:
-        raise HTTPException(status_code=404, detail="Call not found.")
-
-    if not call.get("consent"):
-        raise HTTPException(
-            status_code=403,
-            detail="Recording consent was not provided.",
-        )
-
-    recording_path = call.get("recording_path")
-
-    if not recording_path or not Path(recording_path).is_file():
+    if not call or not call["recording_path"]:
         raise HTTPException(
             status_code=404,
-            detail="No recording is available for this call.",
+            detail="Recording not found.",
         )
 
-    return FileResponse(
-        path=recording_path,
-        media_type="audio/webm",
-        filename=Path(recording_path).name,
-    )
+    path = Path(call["recording_path"]).resolve()
+
+    if path.parent != RECORDINGS_DIR.resolve() or not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Recording file unavailable.",
+        )
+
+    return FileResponse(path, filename=path.name)
