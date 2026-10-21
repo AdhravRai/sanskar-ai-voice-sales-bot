@@ -76,13 +76,18 @@ class ChatMessage(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
 
 
+
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage] = Field(min_length=1, max_length=30)
+    message: str | None = None
+    history: list[ChatMessage] = Field(default_factory=list, max_length=30)
+    messages: list[ChatMessage] | None = Field(default=None, max_length=30)
+
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "ai_configured": client is not None}
+
 
 
 @app.post("/api/chat")
@@ -93,10 +98,29 @@ def chat(request: ChatRequest):
             detail="GROQ_API_KEY is not configured.",
         )
 
-    if any(m.role not in ("user", "assistant") for m in request.messages):
+    if request.messages is not None:
+        conversation = request.messages
+    elif request.message and request.message.strip():
+        conversation = [
+            *request.history,
+            ChatMessage(role="user", content=request.message.strip()),
+        ]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="A customer message is required.",
+        )
+
+    if not conversation or len(conversation) > 30:
+        raise HTTPException(
+            status_code=400,
+            detail="Conversation must contain between 1 and 30 messages.",
+        )
+
+    if any(m.role not in ("user", "assistant") for m in conversation):
         raise HTTPException(status_code=400, detail="Invalid message role.")
 
-    if request.messages[-1].role != "user":
+    if conversation[-1].role != "user":
         raise HTTPException(
             status_code=400,
             detail="The final message must be from the customer.",
@@ -104,7 +128,7 @@ def chat(request: ChatRequest):
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        *[m.model_dump() for m in request.messages],
+        *[m.model_dump() for m in conversation],
     ]
 
     try:
@@ -127,11 +151,9 @@ def chat(request: ChatRequest):
     except APIError as exc:
         raise HTTPException(
             status_code=502,
-            detail=(
-                "The AI provider request failed. "
-                "Check your API limits and configuration."
-            ),
+            detail="The AI provider request failed. Check API limits and configuration.",
         ) from exc
+
 
 
 @app.on_event("startup")
@@ -183,17 +205,28 @@ async def create_call(
 
     recording_path = None
 
+    
     if recording and recording.filename:
-        if recording.content_type not in (
-            "audio/webm",
-            "audio/mp4",
-            "audio/ogg",
-            "audio/wav",
-            "audio/mpeg",
-        ):
+        content_type = (
+            recording.content_type or ""
+        ).split(";")[0].strip().lower()
+
+        extension_by_type = {
+            "audio/webm": ".webm",
+            "audio/mp4": ".mp4",
+            "audio/ogg": ".ogg",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+        }
+
+        extension = extension_by_type.get(content_type)
+
+        if extension is None:
             raise HTTPException(
                 status_code=400,
-                detail="Unsupported audio format.",
+                detail=f"Unsupported audio format: {recording.content_type}",
             )
 
         audio = await recording.read()
@@ -210,18 +243,11 @@ async def create_call(
                 detail="Recording file is empty.",
             )
 
-        extension = {
-            "audio/webm": ".webm",
-            "audio/mp4": ".mp4",
-            "audio/ogg": ".ogg",
-            "audio/wav": ".wav",
-            "audio/mpeg": ".mp3",
-        }[recording.content_type]
-
         filename = f"{uuid4().hex}{extension}"
         path = RECORDINGS_DIR / filename
         path.write_bytes(audio)
         recording_path = str(path)
+
 
     started_at = datetime.now(timezone.utc).isoformat()
     ended_at = started_at
