@@ -11,13 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from groq import Groq, APIError
 from pydantic import BaseModel, Field
+
 from database import (
     init_db,
-    create_call,
+    create_call as save_call_to_db,
     get_all_calls,
     get_call,
     RECORDINGS_DIR,
 )
+
 from sales_analysis import analyze_sales_call
 
 
@@ -263,7 +265,7 @@ async def create_call(
             detail="Call analysis failed. Check the AI provider and retry.",
         ) from exc
 
-    call_id = create_call(
+    call_id = save_call_to_db(
         transcript=messages,
         duration_seconds=duration_seconds,
         consent=consent,
