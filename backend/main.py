@@ -26,10 +26,14 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 app = FastAPI(title="AI Voice Sales Bot API")
 
-allowed_origins = os.getenv(
-    "FRONTEND_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173",
-).split(",")
+frontend_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "https://sanskar-ai-voice-sales-bot.vercel.app"
+    ).split(",")
+    if origin.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
