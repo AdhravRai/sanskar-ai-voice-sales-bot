@@ -18,7 +18,7 @@ from database import (
     get_call,
     RECORDINGS_DIR,
 )
-from sales_analysis import analyze_call
+from sales_analysis import analyze_sales_call
 
 
 load_dotenv()
@@ -227,7 +227,7 @@ async def create_call(
     ended_at = started_at
 
     try:
-        analysis = analyze_call(client, messages)
+        analysis = analyze_sales_call(messages)
     except Exception as exc:
         if recording_path:
             Path(recording_path).unlink(missing_ok=True)
