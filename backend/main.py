@@ -11,11 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from groq import Groq, APIError
 from pydantic import BaseModel, Field
-
 from database import (
-    initialize_db,
-    save_call,
-    list_calls,
+    init_db,
+    create_call,
+    get_all_calls,
     get_call,
     RECORDINGS_DIR,
 )
@@ -137,7 +136,7 @@ def chat(request: ChatRequest):
 
 @app.on_event("startup")
 def startup():
-    initialize_db()
+    init_db()
 
 
 @app.post("/api/calls")
@@ -238,19 +237,20 @@ async def create_call(
             detail="Call analysis failed. Check the AI provider and retry.",
         ) from exc
 
-    call_id = save_call(
-        started_at=started_at,
-        ended_at=ended_at,
+    call_id = create_call(
+        transcript=messages,
         duration_seconds=duration_seconds,
-        transcript=json.dumps(messages),
+        consent=consent,
         recording_path=recording_path,
-        summary=analysis["summary"],
-        customer_requirements=json.dumps(
-            analysis["customer_requirements"]
-        ),
-        objections=json.dumps(analysis["objections"]),
-        next_steps=json.dumps(analysis["next_steps"]),
-        sales_status=analysis["sales_status"],
+        analysis={
+            "summary": analysis["summary"],
+            "customer_requirements": json.dumps(
+                analysis["customer_requirements"]
+            ),
+            "objections": json.dumps(analysis["objections"]),
+            "next_steps": json.dumps(analysis["next_steps"]),
+            "sales_status": analysis["sales_status"],
+        },
     )
 
     return {
@@ -262,10 +262,9 @@ async def create_call(
         "sales_status": analysis["sales_status"],
     }
 
-
 @app.get("/api/calls")
 def call_history():
-    return {"calls": list_calls()}
+    return {"calls": get_all_calls()}
 
 
 @app.get("/api/calls/{call_id}")
